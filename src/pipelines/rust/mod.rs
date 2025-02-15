@@ -773,8 +773,8 @@ impl RustApp {
         }
 
         // must be cdylib or bin
-        if !(art.target.kind.contains(&"bin".to_string())
-            || art.target.kind.contains(&"cdylib".to_string()))
+        if !(art.target.kind.contains(&"bin".to_string()))
+            //|| art.target.kind.contains(&"cdylib".to_string()))
         {
             return false;
         }
