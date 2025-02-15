@@ -12,7 +12,7 @@ use notify::{
 use notify_debouncer_full::{
     new_debouncer_opt, DebounceEventResult, DebouncedEvent, Debouncer, FileIdMap,
 };
-use parking_lot::MappedMutexGuard;
+use std::path::Path;
 use std::{fmt::Write, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     sync::{broadcast, mpsc, watch, Mutex},
@@ -26,17 +26,14 @@ pub enum FsDebouncer {
 }
 
 impl FsDebouncer {
-    pub fn watcher(&mut self) -> &mut dyn Watcher {
+    pub fn watch(
+        &mut self,
+        path: impl AsRef<Path>,
+        recursive_mode: RecursiveMode,
+    ) -> notify::Result<()> {
         match self {
-            Self::Default(deb) => deb.watcher(),
-            Self::Polling(deb) => deb.watcher(),
-        }
-    }
-
-    pub fn cache(&mut self) -> MappedMutexGuard<FileIdMap> {
-        match self {
-            Self::Default(deb) => deb.cache(),
-            Self::Polling(deb) => deb.cache(),
+            Self::Default(deb) => deb.watch(path, recursive_mode),
+            Self::Polling(deb) => deb.watch(path, recursive_mode),
         }
     }
 }
@@ -91,6 +88,8 @@ pub struct WatchSystem {
     last_change: Instant,
     /// The cooldown for the watcher. [`None`] disables the cooldown.
     watcher_cooldown: Option<Duration>,
+    /// Clear the screen before each run
+    clear_screen: bool,
     /// Don't send build errors to the frontend.
     no_error_reporting: bool,
 }
@@ -136,6 +135,7 @@ impl WatchSystem {
             last_build_finished: Instant::now(),
             last_change: Instant::now(),
             watcher_cooldown,
+            clear_screen: cfg.clear_screen,
             no_error_reporting: cfg.no_error_reporting,
         })
     }
@@ -228,6 +228,16 @@ impl WatchSystem {
             }
         }
 
+        if self.clear_screen {
+            // This first message will not be seen if the clear screen worked.
+            tracing::trace!("Clear screen is enabled, clearing the screen");
+            let term = console::Term::stdout();
+            if let Err(err) = term.clear_screen() {
+                tracing::error!("Unable to clear the screen due to error: #{err}");
+            } else {
+                tracing::trace!("Clear screen is enabled, cleared the screen");
+            }
+        }
         self.spawn_build().await;
     }
 
@@ -367,13 +377,11 @@ fn build_watcher(
     // RtcBuild/RtcWatch/RtcServe/&c runtime config objects.
     for path in paths {
         debouncer
-            .watcher()
             .watch(&path, RecursiveMode::Recursive)
             .context(format!(
                 "failed to watch {:?} for file system changes",
                 path
             ))?;
-        debouncer.cache().add_root(&path, RecursiveMode::Recursive);
     }
 
     Ok(debouncer)

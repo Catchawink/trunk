@@ -15,7 +15,7 @@ jobs:
     uses: ./.github/workflows/docs.yaml
 
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     needs:
       - docs
 
@@ -47,7 +47,7 @@ jobs:
           find ./site/public
 
       - name: Deploy
-        uses: peaceiris/actions-gh-pages@v3
+        uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./site/public

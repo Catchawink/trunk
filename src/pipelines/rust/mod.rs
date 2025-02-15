@@ -19,14 +19,11 @@ use crate::{
         CargoMetadata,
     },
     pipelines::rust::sri::{SriBuilder, SriOptions, SriType},
-    processing::{
-        integrity::{IntegrityType, OutputDigest},
-        minify::minify_js,
-    },
-    tools::{self, Application},
+    processing::{integrity::IntegrityType, minify::minify_js},
+    tools::{self, Application, ToolInformation},
 };
 use anyhow::{anyhow, bail, ensure, Context, Result};
-use cargo_metadata::Artifact;
+use cargo_metadata::{Artifact, TargetKind};
 use minify_js::TopLevelMode;
 use seahash::SeaHasher;
 use std::{
@@ -39,7 +36,7 @@ use std::{
 };
 use tokio::{fs, io::AsyncWriteExt, process::Command, sync::mpsc, task::JoinHandle};
 use tracing::log;
-use wasm_bindgen::{find_wasm_bindgen_version, WasmBindgenTarget};
+use wasm_bindgen::{find_wasm_bindgen_version, WasmBindgenFeatures, WasmBindgenTarget};
 use wasm_opt::WasmOptLevel;
 
 /// A Rust application pipeline.
@@ -48,6 +45,10 @@ pub struct RustApp {
     id: Option<usize>,
     /// Runtime config.
     cfg: Arc<RtcBuild>,
+    /// Skip building
+    skip_build: bool,
+    /// Cargo profile to use
+    cargo_profile: Option<String>,
     /// The configuration of the features passed to cargo.
     cargo_features: Features,
     /// Is this module main or a worker?
@@ -77,6 +78,8 @@ pub struct RustApp {
     /// An optional optimization setting that enables wasm-opt. Can be nothing, `0` (default), `1`,
     /// `2`, `3`, `4`, `s or `z`. Using `0` disables wasm-opt completely.
     wasm_opt: WasmOptLevel,
+    /// An optional optimization command line params to wasm-opt if it is enabled.
+    wasm_opt_params: Vec<String>,
     /// The value of the `--target` flag for wasm-bindgen.
     wasm_bindgen_target: WasmBindgenTarget,
     /// Name for the module. Is binary name if given, otherwise it is the name of the cargo
@@ -168,6 +171,12 @@ impl RustApp {
                     WasmOptLevel::Off
                 }
             });
+        let wasm_opt_params = attrs
+            .get("data-wasm-opt-params")
+            .iter()
+            .flat_map(|val| val.split_whitespace())
+            .map(|val| val.to_string())
+            .collect();
         let wasm_bindgen_target = attrs
             .get("data-bindgen-target")
             .map(|s| s.parse())
@@ -187,10 +196,6 @@ impl RustApp {
         let id = Some(id);
         let name = bin.clone().unwrap_or_else(|| manifest.package.name.clone());
 
-        let data_features = attrs.get("data-cargo-features").map(|val| val.to_string());
-        let data_all_features = attrs.contains_key("data-cargo-all-features");
-        let data_no_default_features = attrs.contains_key("data-cargo-no-default-features");
-
         let loader_shim = attrs.contains_key("data-loader-shim");
         if loader_shim {
             ensure!(
@@ -198,6 +203,30 @@ impl RustApp {
                 "Loader shim has no effect when data-type is \"main\"!"
             );
         }
+
+        // cargo profile
+
+        let data_cargo_profile = match cfg.release {
+            true => attrs.get("data-cargo-profile-release"),
+            false => attrs.get("data-cargo-profile-dev"),
+        }
+        .or_else(|| attrs.get("data-cargo-profile"));
+
+        let cargo_profile = match data_cargo_profile {
+            Some(cargo_profile) => {
+                if let Some(config_cargo_profile) = &cfg.cargo_profile {
+                    log::warn!("Cargo profile from configuration ({config_cargo_profile}) will be overridden with HTML file's more specific setting ({cargo_profile})");
+                }
+                Some(cargo_profile.clone())
+            }
+            None => cfg.cargo_profile.as_ref().cloned(),
+        };
+
+        // cargo features
+
+        let data_features = attrs.get("data-cargo-features").map(|val| val.to_string());
+        let data_all_features = attrs.contains_key("data-cargo-all-features");
+        let data_no_default_features = attrs.contains_key("data-cargo-no-default-features");
 
         // Highlander-rule: There can be only one (prohibits contradicting arguments):
         ensure!(
@@ -217,6 +246,10 @@ impl RustApp {
             // features passed to cargo.
             cfg.cargo_features.clone()
         };
+
+        // skip
+
+        let skip_build = attrs.contains_key("data-trunk-skip");
 
         // bindings
 
@@ -244,6 +277,8 @@ impl RustApp {
         Ok(Self {
             id,
             cfg,
+            skip_build,
+            cargo_profile,
             cargo_features,
             manifest,
             ignore_chan,
@@ -255,6 +290,7 @@ impl RustApp {
             reference_types,
             weak_refs,
             wasm_opt,
+            wasm_opt_params,
             wasm_bindgen_target,
             app_type,
             name,
@@ -290,7 +326,9 @@ impl RustApp {
 
         Ok(Some(Self {
             id: None,
+            skip_build: false,
             cargo_features: cfg.cargo_features.clone(),
+            cargo_profile: None,
             cfg,
             manifest,
             ignore_chan,
@@ -302,6 +340,7 @@ impl RustApp {
             reference_types: false,
             weak_refs: false,
             wasm_opt: WasmOptLevel::Off,
+            wasm_opt_params: Default::default(),
             app_type: RustAppType::Main,
             wasm_bindgen_target: WasmBindgenTarget::Web,
             name,
@@ -323,6 +362,10 @@ impl RustApp {
 
     #[tracing::instrument(level = "trace", skip(self))]
     async fn build(mut self) -> Result<TrunkAssetPipelineOutput> {
+        if self.skip_build {
+            return Ok(TrunkAssetPipelineOutput::None);
+        }
+
         // run the cargo build
         let wasm = self.cargo_build().await.context("running cargo build")?;
 
@@ -358,7 +401,10 @@ impl RustApp {
             "--manifest-path",
             &self.manifest.manifest_path,
         ];
-        if self.cfg.release {
+        if let Some(profile) = &self.cargo_profile {
+            args.push("--profile");
+            args.push(profile);
+        } else if self.cfg.release {
             args.push("--release");
         }
         if self.cfg.offline {
@@ -373,6 +419,10 @@ impl RustApp {
         if let Some(bin) = &self.bin {
             args.push("--bin");
             args.push(bin);
+        }
+        if let Some(example) = &self.cfg.cargo_example {
+            args.push("--example");
+            args.push(example);
         }
 
         match &self.cargo_features {
@@ -392,7 +442,7 @@ impl RustApp {
             }
         }
 
-        let build_res = common::run_command("cargo", Path::new("cargo"), &args)
+        let build_res = common::run_command("cargo", "cargo", &args, &self.cfg.working_directory)
             .await
             .context("error during cargo build execution");
 
@@ -416,6 +466,7 @@ impl RustApp {
         tracing::debug!("fetching cargo artifacts");
         args.push("--message-format=json");
         let artifacts_out = Command::new("cargo")
+            .current_dir(&self.cfg.core.working_directory)
             .args(args.as_slice())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -476,16 +527,17 @@ impl RustApp {
     #[tracing::instrument(level = "trace", skip(self))]
     async fn wasm_bindgen_build(&mut self, wasm_path: &Path) -> Result<RustAppOutput> {
         let version = find_wasm_bindgen_version(&self.cfg.tools, &self.manifest);
-        let wasm_bindgen = tools::get(
+        let ToolInformation {
+            path: wasm_bindgen,
+            version,
+        } = tools::get_info(
             Application::WasmBindgen,
             version.as_deref(),
             self.cfg.offline,
-            &tools::HttpClientOptions {
-                root_certificate: self.cfg.root_certificate.clone(),
-                accept_invalid_certificates: self.cfg.accept_invalid_certs,
-            },
+            &self.cfg.client_options(),
         )
         .await?;
+        let wasm_bindgen_features = WasmBindgenFeatures::from_version(&version)?;
 
         // Ensure our output dir is in place.
         let wasm_bindgen_name = Application::WasmBindgen.name();
@@ -529,9 +581,14 @@ impl RustApp {
 
         // Invoke wasm-bindgen.
         tracing::debug!("calling wasm-bindgen for {}", self.name);
-        common::run_command(wasm_bindgen_name, &wasm_bindgen, &args)
-            .await
-            .map_err(|err| check_target_not_found_err(err, wasm_bindgen_name))?;
+        common::run_command(
+            wasm_bindgen_name,
+            &wasm_bindgen,
+            &args,
+            &self.cfg.working_directory,
+        )
+        .await
+        .map_err(|err| check_target_not_found_err(err, wasm_bindgen_name))?;
 
         // Copy the generated WASM & JS loader to the dist dir.
         tracing::debug!("copying generated wasm-bindgen artifacts");
@@ -618,12 +675,6 @@ impl RustApp {
                 .context("error writing loader shim script")?;
         }
 
-        let ts_output = if self.typescript {
-            Some(hashed_ts_name)
-        } else {
-            None
-        };
-
         // Check for any snippets, and copy them over.
         let snippets_dir_src = bindgen_out.join(SNIPPETS_DIR);
         let snippets = if path_exists(&snippets_dir_src).await? {
@@ -698,14 +749,13 @@ impl RustApp {
             js_output: hashed_js_name,
             wasm_output: hashed_wasm_name,
             wasm_size,
-            ts_output,
-            loader_shim_output: hashed_loader_name,
             r#type: self.app_type,
             cross_origin: self.cross_origin,
             integrities: self.sri.clone(),
             import_bindings: self.import_bindings,
             import_bindings_name: self.import_bindings_name.clone(),
             initializer,
+            wasm_bindgen_features,
         })
     }
 
@@ -772,11 +822,20 @@ impl RustApp {
             return false;
         }
 
-        // must be cdylib or bin
-        if !(art.target.kind.contains(&"bin".to_string()))
-            //|| art.target.kind.contains(&"cdylib".to_string()))
+        // must be cdylib, bin, or example
+        if !(art.target.kind.contains(&TargetKind::Bin))
+            //|| art.target.kind.contains(&TargetKind::CDyLib)
+            //|| art.target.kind.contains(&TargetKind::Example))
         {
             return false;
+        }
+
+        // Are we building an example?
+        if let Some(example) = &self.cfg.cargo_example {
+            // it must match
+            if example != &art.target.name {
+                return false;
+            }
         }
 
         // if we have the --bin argument
@@ -838,10 +897,7 @@ impl RustApp {
             Application::WasmOpt,
             version,
             self.cfg.offline,
-            &tools::HttpClientOptions {
-                root_certificate: self.cfg.root_certificate.clone(),
-                accept_invalid_certificates: self.cfg.accept_invalid_certs,
-            },
+            &self.cfg.client_options(),
         )
         .await?;
 
@@ -862,6 +918,7 @@ impl RustApp {
         let output = output.join(format!("{}_bg.wasm", self.name));
         let arg_output = format!("--output={output}");
         let arg_opt_level = format!("-O{}", self.wasm_opt.as_ref());
+        let arg_opt_params = self.wasm_opt_params.as_slice();
         let target_wasm = self
             .cfg
             .staging_dist
@@ -874,9 +931,11 @@ impl RustApp {
             args.push("--enable-reference-types");
         }
 
+        args.extend(arg_opt_params.iter().map(|s| s.as_str()));
+
         // Invoke wasm-opt.
         tracing::debug!("calling wasm-opt");
-        common::run_command(wasm_opt_name, &wasm_opt, &args)
+        common::run_command(wasm_opt_name, &wasm_opt, &args, &self.cfg.working_directory)
             .await
             .map_err(|err| check_target_not_found_err(err, wasm_opt_name))?;
 
@@ -907,11 +966,4 @@ impl RustApp {
 
         Ok(())
     }
-}
-
-/// Integrity of outputs
-#[derive(Debug, Default)]
-pub struct IntegrityOutput {
-    pub wasm: OutputDigest,
-    pub js: OutputDigest,
 }

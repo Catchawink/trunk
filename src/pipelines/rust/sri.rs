@@ -1,3 +1,4 @@
+use crate::common::nonce_attr;
 use crate::config::types::CrossOrigin;
 use crate::{
     common::html_rewrite::Document,
@@ -71,20 +72,21 @@ impl SriBuilder {
         T: AsRef<[u8]>,
         Fut: Future<Output = Result<T, E>>,
     {
-        if !matches!(self.r#type, IntegrityType::None) {
-            let name = name.into();
-            let digest = OutputDigest::generate_async(self.r#type, source).await?;
-            tracing::debug!(
-                "recording SRI record - type: {:?}. name: {name}, value: {digest:?}",
-                self.r#type,
-            );
-            let key = SriKey { r#type, name };
-            let entry = SriEntry { digest, options };
-            if let Some(record) = self.result.integrities.iter_mut().find(|(k, _)| k == &key) {
-                record.1 = entry;
-            } else {
-                self.result.integrities.push((key, entry));
-            }
+        let name = name.into();
+        let digest = match self.r#type {
+            IntegrityType::None => OutputDigest::default(),
+            _ => OutputDigest::generate_async(self.r#type, source).await?,
+        };
+        tracing::debug!(
+            "recording SRI record - type: {:?}. name: {name}, value: {digest:?}",
+            self.r#type,
+        );
+        let key = SriKey { r#type, name };
+        let entry = SriEntry { digest, options };
+        if let Some(record) = self.result.integrities.iter_mut().find(|(k, _)| k == &key) {
+            record.1 = entry;
+        } else {
+            self.result.integrities.push((key, entry));
         }
 
         Ok(())
@@ -147,17 +149,22 @@ impl SriResult {
         head: &str,
         base: impl Display,
         cross_origin: CrossOrigin,
+        create_nonce: &Option<String>,
     ) -> anyhow::Result<()> {
+        let nonce = nonce_attr(create_nonce);
         for (SriKey { r#type, name }, SriEntry { digest, options }) in &self.integrities {
-            if let Some(integrity) = digest.to_integrity_value() {
-                let preload = format!(
-                    r#"
-<link rel="{type}" href="{base}{name}" crossorigin={cross_origin} integrity="{integrity}"{options}>"#,
-                );
-                location
-                    .append_html(head, &preload)
-                    .context("Unable to write SRI.")?;
-            }
+            let preload = if let Some(integrity) = digest.to_integrity_value() {
+                format!(
+                    r#"<link rel="{type}"{nonce} href="{base}{name}" crossorigin="{cross_origin}" integrity="{integrity}"{options}>"#,
+                )
+            } else {
+                format!(
+                    r#"<link rel="{type}"{nonce} href="{base}{name}" crossorigin="{cross_origin}"{options}>"#,
+                )
+            };
+            location
+                .append_html(head, &preload)
+                .context("Unable to write SRI.")?;
         }
 
         Ok(())

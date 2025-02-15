@@ -19,9 +19,20 @@ pub struct Build {
     #[serde(default = "default::target")]
     pub target: PathBuf,
 
+    /// The name of the output HTML file.
+    ///
+    /// If not set, use the same name as the target HTML file.
+    pub html_output: Option<String>,
+
     /// Build in release mode [default: false]
     #[serde(default)]
     pub release: bool,
+
+    /// Cargo profile to use.
+    ///
+    /// Overrides the default chosen by cargo. Ignored if the 'index.html' has one configured.
+    #[serde(default)]
+    pub cargo_profile: Option<String>,
 
     /// The output dir for all final assets
     #[serde(default = "default::dist")]
@@ -64,6 +75,11 @@ pub struct Build {
     /// Whether to include hash values in the output file names
     #[serde(default = "default::filehash")]
     pub filehash: bool,
+
+    /// Whether to build an example.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub example: Option<String>,
 
     /// Optional pattern for the app loader script [default: None]
     ///
@@ -135,6 +151,14 @@ pub struct Build {
     /// are sure it is caused due to a false positive.
     #[serde(default)]
     pub allow_self_closing_script: bool,
+
+    /// Create 'nonce' attributes with a placeholder.
+    #[serde(default)]
+    pub create_nonce: bool,
+
+    /// The placeholder which is used in the 'nonce' attribute.
+    #[serde(default = "default::nonce_placeholder")]
+    pub nonce_placeholder: String,
 }
 
 fn string_or_vec<'de, T, D>(deserializer: D) -> Result<Vec<T>, D::Error>
@@ -183,7 +207,9 @@ impl Default for Build {
     fn default() -> Self {
         Self {
             target: default::target(),
+            html_output: None,
             release: false,
+            cargo_profile: None,
             dist: default::dist(),
             offline: false,
             frozen: false,
@@ -193,6 +219,7 @@ impl Default for Build {
             no_default_features: false,
             all_features: false,
             features: vec![],
+            example: None,
             filehash: default::filehash(),
             pattern_script: None,
             inject_scripts: default::inject_scripts(),
@@ -203,6 +230,8 @@ impl Default for Build {
             minify: Default::default(),
             no_sri: false,
             allow_self_closing_script: false,
+            create_nonce: false,
+            nonce_placeholder: default::nonce_placeholder(),
         }
     }
 }
@@ -225,6 +254,10 @@ mod default {
 
     pub const fn inject_scripts() -> bool {
         true
+    }
+
+    pub fn nonce_placeholder() -> String {
+        "{{__TRUNK NONCE__}}".to_string()
     }
 }
 

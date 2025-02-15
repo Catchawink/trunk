@@ -66,6 +66,7 @@ pub struct Configuration {
     pub clean: Clean,
 
     #[serde(default)]
+    #[serde(alias = "proxy")]
     pub proxies: Proxies,
 }
 
@@ -100,10 +101,12 @@ impl ConfigModel for Configuration {
             log::warn!("The proxy fields in the configuration are deprecated and will be removed in a future version. Migrate those settings into an entry of the `proxies` field, which allows adding more than one.");
             self.proxies.0.push(Proxy {
                 backend,
+                request_headers: Default::default(),
                 rewrite: self.serve.proxy_rewrite.take(),
                 ws: self.serve.proxy_ws.unwrap_or_default(),
                 insecure: self.serve.proxy_insecure.unwrap_or_default(),
                 no_system_proxy: self.serve.proxy_no_system_proxy.unwrap_or_default(),
+                no_redirect: self.serve.proxy_no_redirect.unwrap_or_default(),
             })
         }
 
@@ -117,6 +120,14 @@ pub async fn load(path: Option<PathBuf>) -> Result<(Configuration, PathBuf)> {
     match path {
         // if we have a file, load it
         Some(path) if path.is_file() => {
+            // Canonicalize the path to the configuration, so that we get a proper parent.
+            // Otherwise, we might end up with a parent of '', which won't work later on.
+            let path = path.canonicalize().with_context(|| {
+                format!(
+                    "unable to canonicalize path to configuration: '{}'",
+                    path.display()
+                )
+            })?;
             let Some(cwd) = path.parent() else {
                 bail!("unable to get parent directory of '{}'", path.display());
             };

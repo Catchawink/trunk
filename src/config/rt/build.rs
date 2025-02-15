@@ -1,12 +1,15 @@
 use super::{super::STAGE_DIR, RtcBuilder};
-use crate::config::{
-    models::{Configuration, Hook, Tools},
-    rt::{CoreOptions, RtcCore},
-    types::{BaseUrl, Minify},
-    Hooks,
+use crate::{
+    config::{
+        models::{Configuration, Hook, Tools},
+        rt::{CoreOptions, RtcCore},
+        types::{BaseUrl, Minify},
+        Hooks,
+    },
+    tools::HttpClientOptions,
 };
 use anyhow::{ensure, Context};
-use std::{collections::HashMap, io::ErrorKind, ops::Deref, path::PathBuf};
+use std::{collections::HashMap, ops::Deref, path::PathBuf};
 
 /// Config options for the cargo build command
 #[derive(Clone, Debug)]
@@ -28,10 +31,14 @@ pub struct RtcBuild {
     pub core: RtcCore,
     /// The index HTML file to drive the bundling process.
     pub target: PathBuf,
+    /// The name of the output HTML file.
+    pub html_output_filename: String,
     /// The parent directory of the target index HTML file.
     pub target_parent: PathBuf,
     /// Build in release mode.
     pub release: bool,
+    /// Cargo profile to use instead of the default selection.
+    pub cargo_profile: Option<String>,
     /// Build without network access
     pub offline: bool,
     /// Require Cargo.lock and cache are up to date
@@ -49,6 +56,8 @@ pub struct RtcBuild {
     pub staging_dist: PathBuf,
     /// The configuration of the features passed to cargo.
     pub cargo_features: Features,
+    /// Optional example to be passed to cargo.
+    pub cargo_example: Option<String>,
     /// Configuration for automatic application download.
     pub tools: Tools,
     /// Build process hooks.
@@ -68,10 +77,12 @@ pub struct RtcBuild {
     /// `pattern_script` and `pattern_preload`.
     pub pattern_params: HashMap<String, String>,
     /// Optional root certificate chain for use when downloading dependencies.
+    #[cfg(any(feature = "native-tls", feature = "rustls"))]
     pub root_certificate: Option<PathBuf>,
     /// Sets if reqwest is allowed to ignore certificate validation errors (defaults to false).
     ///
     /// **WARNING**: Setting this to true can make you vulnerable to man-in-the-middle attacks. Sometimes this is necessary when working behind corporate proxies.
+    #[cfg(any(feature = "native-tls", feature = "rustls"))]
     pub accept_invalid_certs: bool,
     /// Control minification
     pub minify: Minify,
@@ -79,6 +90,8 @@ pub struct RtcBuild {
     pub no_sri: bool,
     /// Ignore error's due to self-closed script tags, instead will issue a warning.
     pub allow_self_closing_script: bool,
+    /// When set, create nonce attributes with the option as placeholder
+    pub create_nonce: Option<String>,
 }
 
 impl Deref for RtcBuild {
@@ -125,6 +138,15 @@ impl RtcBuild {
             )
         })?;
 
+        let html_output_filename = match build.html_output {
+            Some(html_output) => html_output,
+            None => target
+                .file_name()
+                .context("target path isn't a file path")?
+                .to_string_lossy()
+                .into_owned(),
+        };
+
         // Get the target HTML's parent dir, falling back to OS specific root, as that is the only
         // time when no parent could be determined.
         let target_parent = target
@@ -136,14 +158,10 @@ impl RtcBuild {
         // we would want to avoid such an action at this layer, however to ensure that other layers
         // have a reliable FS path to work with, we make an exception here.
         let final_dist = core.working_directory.join(&build.dist);
-        if !final_dist.exists() {
-            std::fs::create_dir(&final_dist)
-                .or_else(|err| match err.kind() {
-                    ErrorKind::AlreadyExists => Ok(()),
-                    _ => Err(err),
-                })
-                .with_context(|| format!("error creating final dist directory {final_dist:?}"))?;
-        }
+
+        std::fs::create_dir_all(&final_dist)
+            .with_context(|| format!("error creating final dist directory {final_dist:?}"))?;
+
         let final_dist = final_dist
             .canonicalize()
             .context("error taking canonical path to dist dir")?;
@@ -172,16 +190,21 @@ impl RtcBuild {
             public_url = public_url.fix_trailing_slash();
         }
 
+        let create_nonce = build.create_nonce.then_some(build.nonce_placeholder);
+
         Ok(Self {
             core,
             target,
+            html_output_filename,
             target_parent,
             release: build.release,
+            cargo_profile: build.cargo_profile,
             public_url,
             filehash: build.filehash,
             staging_dist,
             final_dist,
             cargo_features,
+            cargo_example: build.example,
             tools,
             hooks,
             inject_autoloader,
@@ -192,11 +215,14 @@ impl RtcBuild {
             offline: build.offline,
             frozen: build.frozen,
             locked: build.locked,
+            #[cfg(any(feature = "native-tls", feature = "rustls"))]
             root_certificate: build.root_certificate.map(PathBuf::from),
+            #[cfg(any(feature = "native-tls", feature = "rustls"))]
             accept_invalid_certs: build.accept_invalid_certs,
             minify: build.minify,
             no_sri: build.no_sri,
             allow_self_closing_script: build.allow_self_closing_script,
+            create_nonce,
         })
     }
 
@@ -204,6 +230,7 @@ impl RtcBuild {
     #[cfg(test)]
     pub async fn new_test(tmpdir: &std::path::Path) -> anyhow::Result<Self> {
         let target = tmpdir.join("index.html");
+        let html_output_filename = String::from("index.html");
         let target_parent = tmpdir.to_path_buf();
         let final_dist = tmpdir.join("dist");
         let staging_dist = final_dist.join(".stage");
@@ -213,13 +240,16 @@ impl RtcBuild {
         Ok(Self {
             core: RtcCore::new_test(tmpdir),
             target,
+            html_output_filename,
             target_parent,
             release: false,
+            cargo_profile: None,
             public_url: Default::default(),
             filehash: true,
             final_dist,
             staging_dist,
             cargo_features: Features::All,
+            cargo_example: None,
             tools: Default::default(),
             hooks: Vec::new(),
             inject_autoloader: true,
@@ -235,6 +265,7 @@ impl RtcBuild {
             minify: Minify::Never,
             no_sri: false,
             allow_self_closing_script: false,
+            create_nonce: None,
         })
     }
 
@@ -249,6 +280,16 @@ impl RtcBuild {
             (Minify::Never, _) => false,
             (Minify::OnRelease, release) => release,
             (Minify::Always, _) => true,
+        }
+    }
+
+    /// Build [`HttpClientOptions`] options form configuration.
+    pub fn client_options(&self) -> HttpClientOptions {
+        HttpClientOptions {
+            #[cfg(any(feature = "native-tls", feature = "rustls"))]
+            root_certificate: self.root_certificate.clone(),
+            #[cfg(any(feature = "native-tls", feature = "rustls"))]
+            accept_invalid_certificates: self.accept_invalid_certs,
         }
     }
 }

@@ -21,6 +21,8 @@ pub enum Application {
     Sass,
     /// tailwindcss for generating css
     TailwindCss,
+    /// tailwindcss-extra for generating css with DaisyUI bundled.
+    TailwindCssExtra,
     /// wasm-bindgen for generating the JS bindings.
     WasmBindgen,
     /// wasm-opt to improve performance and size of the output file further.
@@ -33,10 +35,12 @@ pub struct HttpClientOptions {
     /// Use this specific root certificate to validate the certificate chain. Optional.
     ///
     /// Useful when behind a corporate proxy that uses a self-signed root certificate.
+    #[cfg(any(feature = "native-tls", feature = "rustls"))]
     pub root_certificate: Option<PathBuf>,
     /// Allows Trunk to accept certificates that can't be verified when fetching dependencies. Defaults to false.
     ///
     /// **WARNING**: This is inherently unsafe and can open you up to Man-in-the-middle attacks. But sometimes it is required when working behind corporate proxies.
+    #[cfg(any(feature = "native-tls", feature = "rustls"))]
     pub accept_invalid_certificates: bool,
 }
 
@@ -46,6 +50,7 @@ impl Application {
         match self {
             Self::Sass => "sass",
             Self::TailwindCss => "tailwindcss",
+            Self::TailwindCssExtra => "tailwindcss-extra",
             Self::WasmBindgen => "wasm-bindgen",
             Self::WasmOpt => "wasm-opt",
         }
@@ -57,6 +62,7 @@ impl Application {
             match self {
                 Self::Sass => "sass.bat",
                 Self::TailwindCss => "tailwindcss.exe",
+                Self::TailwindCssExtra => "tailwindcss-extra.exe",
                 Self::WasmBindgen => "wasm-bindgen.exe",
                 Self::WasmOpt => "bin/wasm-opt.exe",
             }
@@ -64,6 +70,7 @@ impl Application {
             match self {
                 Self::Sass => "sass",
                 Self::TailwindCss => "tailwindcss",
+                Self::TailwindCssExtra => "tailwindcss-extra",
                 Self::WasmBindgen => "wasm-bindgen",
                 Self::WasmOpt => "bin/wasm-opt",
             }
@@ -81,6 +88,7 @@ impl Application {
                 }
             }
             Self::TailwindCss => &[],
+            Self::TailwindCssExtra => &[],
             Self::WasmBindgen => &[],
             Self::WasmOpt => {
                 if cfg!(target_os = "macos") {
@@ -97,6 +105,7 @@ impl Application {
         match self {
             Self::Sass => "1.69.5",
             Self::TailwindCss => "3.3.5",
+            Self::TailwindCssExtra => "1.7.25",
             Self::WasmBindgen => "0.2.89",
             Self::WasmOpt => "version_116",
         }
@@ -137,6 +146,13 @@ impl Application {
                 _ => bail!("Unable to download tailwindcss for {target_os} {target_arch}")
             },
 
+            Self::TailwindCssExtra => match (target_os, target_arch) {
+                ("windows", "x86_64") => format!("https://github.com/dobicinaitis/tailwind-cli-extra/releases/download/v{version}/tailwindcss-extra-windows-x64.exe"),
+                ("macos" | "linux", "x86_64") => format!("https://github.com/dobicinaitis/tailwind-cli-extra/releases/download/v{version}/tailwindcss-extra-{target_os}-x64"),
+                ("macos" | "linux", "aarch64") => format!("https://github.com/dobicinaitis/tailwind-cli-extra/releases/download/v{version}/tailwindcss-extra-{target_os}-arm64"),
+                _ => bail!("Unable to download tailwindcss for {target_os} {target_arch}")
+            },
+
             Self::WasmBindgen => match (target_os, target_arch) {
                 ("windows", "x86_64") => format!("https://github.com/rustwasm/wasm-bindgen/releases/download/{version}/wasm-bindgen-{version}-x86_64-pc-windows-msvc.tar.gz"),
                 ("macos", "x86_64") => format!("https://github.com/rustwasm/wasm-bindgen/releases/download/{version}/wasm-bindgen-{version}-x86_64-apple-darwin.tar.gz"),
@@ -158,6 +174,7 @@ impl Application {
         match self {
             Application::Sass => "--version",
             Application::TailwindCss => "--help",
+            Application::TailwindCssExtra => "--help",
             Application::WasmBindgen => "--version",
             Application::WasmOpt => "--version",
         }
@@ -173,6 +190,12 @@ impl Application {
                 .with_context(|| format!("missing or malformed version output: {}", text))?
                 .to_owned(),
             Application::TailwindCss => text
+                .lines()
+                .find(|s| !str::is_empty(s))
+                .and_then(|s| s.split(" v").nth(1))
+                .with_context(|| format!("missing or malformed version output: {}", text))?
+                .to_owned(),
+            Application::TailwindCssExtra => text
                 .lines()
                 .find(|s| !str::is_empty(s))
                 .and_then(|s| s.split(" v").nth(1))
@@ -244,6 +267,14 @@ impl AppCache {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolInformation {
+    /// The path to the tool's binary
+    pub path: PathBuf,
+    /// The version of the tool
+    pub version: String,
+}
+
 /// Locate the given application and download it if missing.
 #[tracing::instrument(level = "debug")]
 pub async fn get(
@@ -252,6 +283,17 @@ pub async fn get(
     offline: bool,
     client_options: &HttpClientOptions,
 ) -> Result<PathBuf> {
+    Ok(get_info(app, version, offline, client_options).await?.path)
+}
+
+/// Locate the given application and download it if missing, returning detailed information.
+#[tracing::instrument(level = "debug")]
+pub async fn get_info(
+    app: Application,
+    version: Option<&str>,
+    offline: bool,
+    client_options: &HttpClientOptions,
+) -> Result<ToolInformation> {
     tracing::debug!("Getting tool");
 
     if let Some((path, detected_version)) = find_system(app).await {
@@ -262,7 +304,10 @@ pub async fn get(
             if required_version == detected_version {
                 // and a match, so return early
                 tracing::debug!(%detected_version, "using system installed binary: {}", path.display());
-                return Ok(path);
+                return Ok(ToolInformation {
+                    path,
+                    version: detected_version,
+                });
             } else if offline {
                 // a mismatch, in offline mode, we can't help here
                 bail!(
@@ -271,11 +316,14 @@ pub async fn get(
                 )
             } else {
                 // a mismatch, so we need to download
-                tracing::info!("tool version mismatch (required: {required_version}, system: {detected_version})");
+                tracing::debug!("tool version mismatch (required: {required_version}, system: {detected_version})");
             }
         } else {
             // we don't require any specific version
-            return Ok(path);
+            return Ok(ToolInformation {
+                path,
+                version: detected_version,
+            });
         }
     }
 
@@ -306,7 +354,10 @@ pub async fn get(
         bin_path.display()
     );
 
-    Ok(bin_path)
+    Ok(ToolInformation {
+        path: bin_path,
+        version: version.to_owned(),
+    })
 }
 
 /// Try to find a global system installed version of the application.
@@ -350,6 +401,7 @@ async fn download(
 ) -> Result<PathBuf> {
     tracing::info!(version = version, "downloading {}", app.name());
 
+    #[cfg(any(feature = "native-tls", feature = "rustls"))]
     if client_options.accept_invalid_certificates {
         tracing::warn!(
             "Accept Invalid Certificates is set to true. This can open you up to MITM attacks."
@@ -458,7 +510,9 @@ pub async fn cache_dir() -> Result<PathBuf> {
     Ok(path)
 }
 
-async fn get_http_client(client_options: &HttpClientOptions) -> Result<reqwest::Client> {
+async fn get_http_client(
+    #[allow(unused_variables)] client_options: &HttpClientOptions,
+) -> Result<reqwest::Client> {
     let builder = reqwest::ClientBuilder::new();
 
     #[cfg(any(feature = "native-tls", feature = "rustls"))]
@@ -542,12 +596,7 @@ mod archive {
                     }
                 }
                 Self::None(in_file) => {
-                    let create_dir_result = std::fs::create_dir(target_directory);
-                    if let Err(e) = &create_dir_result {
-                        if e.kind() != std::io::ErrorKind::AlreadyExists {
-                            create_dir_result.context("failed to open file for")?;
-                        }
-                    }
+                    std::fs::create_dir_all(target_directory).context("failed to open file for")?;
 
                     let mut out_file_path = target_directory.to_path_buf();
                     out_file_path.push(file);
@@ -762,5 +811,11 @@ mod tests {
         Application::TailwindCss,
         "tailwindcss v3.3.2",
         "3.3.2"
+    );
+    table_test_format_version!(
+        tailwindcss_extra_pre_compiled,
+        Application::TailwindCssExtra,
+        "tailwindcss-extra v1.7.25",
+        "1.7.25"
     );
 }

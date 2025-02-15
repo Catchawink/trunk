@@ -1,7 +1,10 @@
 //! Source HTML pipelines.
 
 use crate::{
-    common::html_rewrite::{Document, DocumentOptions},
+    common::{
+        html_rewrite::{Document, DocumentOptions},
+        nonce_attr,
+    },
     config::{rt::RtcBuild, types::WsProtocol},
     hooks::{spawn_hooks, wait_hooks},
     pipelines::{
@@ -183,9 +186,12 @@ impl HtmlPipeline {
             false => target_html.into_inner(),
         };
 
-        fs::write(self.cfg.staging_dist.join("index.html"), &output_html)
-            .await
-            .context("error writing finalized HTML output")?;
+        fs::write(
+            self.cfg.staging_dist.join(&self.cfg.html_output_filename),
+            &output_html,
+        )
+        .await
+        .context("error writing finalized HTML output")?;
 
         // Spawn and wait on post-build hooks.
         wait_hooks(spawn_hooks(self.cfg.clone(), PipelineStage::PostBuild)).await?;
@@ -258,7 +264,8 @@ impl HtmlPipeline {
             target_html.append_html(
                 "body",
                 &format!(
-                    "<script>{}</script>",
+                    "<script{}>{}</script>",
+                    nonce_attr(&self.cfg.create_nonce),
                     RELOAD_SCRIPT.replace(
                         "{{__TRUNK_WS_PROTOCOL__}}",
                         &self.ws_protocol.map(|p| p.to_string()).unwrap_or_default()

@@ -9,14 +9,18 @@
         "accept_invalid_certs": false,
         "all_features": false,
         "allow_self_closing_script": false,
+        "cargo_profile": null,
+        "create_nonce": false,
         "dist": "dist",
         "filehash": true,
         "frozen": false,
+        "html_output": null,
         "inject_scripts": true,
         "locked": false,
         "minify": "never",
         "no_default_features": false,
         "no_sri": false,
+        "nonce_placeholder": "{{__TRUNK NONCE__}}",
         "offline": false,
         "public_url": "/",
         "public_url_no_trailing_slash_fix": false,
@@ -106,10 +110,30 @@
           "default": false,
           "type": "boolean"
         },
+        "cargo_profile": {
+          "description": "Cargo profile to use.\n\nOverrides the default chosen by cargo. Ignored if the 'index.html' has one configured.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "create_nonce": {
+          "description": "Create 'nonce' attributes with a placeholder.",
+          "default": false,
+          "type": "boolean"
+        },
         "dist": {
           "description": "The output dir for all final assets",
           "default": "dist",
           "type": "string"
+        },
+        "example": {
+          "description": "Whether to build an example.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "features": {
           "description": "A comma-separated list of features to activate, must not be used with all-features",
@@ -134,6 +158,13 @@
           "description": "Require Cargo.lock and cache are up to date",
           "default": false,
           "type": "boolean"
+        },
+        "html_output": {
+          "description": "The name of the output HTML file.\n\nIf not set, use the same name as the target HTML file.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "inject_scripts": {
           "description": "Whether to inject scripts into your index file.\n\nThese values can only be provided via config file.",
@@ -163,6 +194,11 @@
           "description": "Allows disabling sub-resource integrity (SRI)",
           "default": false,
           "type": "boolean"
+        },
+        "nonce_placeholder": {
+          "description": "The placeholder which is used in the 'nonce' attribute.",
+          "default": "{{__TRUNK NONCE__}}",
+          "type": "string"
         },
         "offline": {
           "description": "Run without accessing the network",
@@ -261,6 +297,26 @@
             "type": "string"
           }
         },
+        "linux": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/HookOverride"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "macos": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/HookOverride"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "stage": {
           "description": "The stage in the build process to execute this hook.",
           "allOf": [
@@ -268,6 +324,37 @@
               "$ref": "#/definitions/PipelineStage"
             }
           ]
+        },
+        "windows": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/HookOverride"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "HookOverride": {
+      "description": "OS-specific overrides.",
+      "type": "object",
+      "required": [
+        "command"
+      ],
+      "properties": {
+        "command": {
+          "description": "The command to run for this hook.",
+          "type": "string"
+        },
+        "command_arguments": {
+          "description": "Any arguments to pass to the command.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       }
     },
@@ -355,10 +442,23 @@
           "default": false,
           "type": "boolean"
         },
+        "no_redirect": {
+          "description": "Automatically redirect proxy requests? `no_redirect` defaults to `false`, i.e. yes, follow redirects automatically.",
+          "default": false,
+          "type": "boolean"
+        },
         "no_system_proxy": {
           "description": "Configure the proxy to bypass the system proxy.",
           "default": false,
           "type": "boolean"
+        },
+        "request_headers": {
+          "description": "A set of headers to pass to the proxied backend.",
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
         },
         "rewrite": {
           "description": "An optional URI prefix which is to be used as the base URI for proxying requests, which defaults to the URI of the backend.\n\nWhen a value is specified, requests received on this URI will have this URI segment replaced with the URI of the `backend`.",
@@ -397,6 +497,35 @@
             "format": "ip"
           }
         },
+        "aliases": {
+          "description": "The aliases to serve on.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "csp": {
+          "description": "The CSP;  {{NONE}} is replaced by a random nonce",
+          "default": [
+            "script-src 'wasm-unsafe-eval' 'nonce-{{NONCE}}'",
+            "style-src 'nonce-{{NONCE}}'"
+          ],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "disable_address_lookup": {
+          "description": "Disable the reverse DNS lookup during startup",
+          "default": false,
+          "type": "boolean"
+        },
+        "disable_csp": {
+          "description": "Disable CSP header",
+          "default": false,
+          "type": "boolean"
+        },
         "headers": {
           "description": "Additional headers to send in responses",
           "default": {},
@@ -417,6 +546,11 @@
         },
         "no_spa": {
           "description": "Disable fallback to index.html for missing files",
+          "default": false,
+          "type": "boolean"
+        },
+        "open": {
+          "description": "Open a browser tab once the initial build is complete [default: false]",
           "default": false,
           "type": "boolean"
         },
@@ -453,6 +587,14 @@
           "description": "Configure the proxy to accept insecure requests",
           "default": null,
           "deprecated": true,
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "proxy_no_redirect": {
+          "description": "Configure the proxy to not follow redirects",
+          "default": null,
           "type": [
             "boolean",
             "null"

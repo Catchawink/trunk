@@ -1,8 +1,8 @@
 use super::super::trunk_id_selector;
 use crate::{
-    common::html_rewrite::Document,
+    common::{html_rewrite::Document, nonce_attr},
     config::{rt::RtcBuild, types::CrossOrigin},
-    pipelines::rust::{sri::SriBuilder, RustAppType},
+    pipelines::rust::{sri::SriBuilder, wasm_bindgen::WasmBindgenFeatures, RustAppType},
 };
 use anyhow::bail;
 use std::{collections::HashMap, sync::Arc};
@@ -19,10 +19,6 @@ pub struct RustAppOutput {
     pub wasm_output: String,
     /// The size of the WASM file
     pub wasm_size: u64,
-    /// The filename of the generated .ts file written to the dist dir.
-    pub ts_output: Option<String>,
-    /// The filename of the generated loader shim script for web workers written to the dist dir.
-    pub loader_shim_output: Option<String>,
     /// Is this module main or a worker.
     pub r#type: RustAppType,
     /// The cross-origin setting for loading the resources
@@ -35,6 +31,8 @@ pub struct RustAppOutput {
     pub import_bindings_name: Option<String>,
     /// The target of the initializer module
     pub initializer: Option<String>,
+    /// The features supported by the version of wasm-bindgen used
+    pub wasm_bindgen_features: WasmBindgenFeatures,
 }
 
 pub fn pattern_evaluate(template: &str, params: &HashMap<String, String>) -> String {
@@ -86,10 +84,13 @@ impl RustAppOutput {
         if let Some(pattern) = pattern_preload {
             dom.append_html(head, &pattern_evaluate(pattern, &params))?;
         } else {
-            self.integrities
-                .clone()
-                .build()
-                .inject(dom, head, base, self.cross_origin)?;
+            self.integrities.clone().build().inject(
+                dom,
+                head,
+                base,
+                self.cross_origin,
+                &self.cfg.create_nonce,
+            )?;
         }
 
         let script = match pattern_script {
@@ -130,31 +131,40 @@ window.{bindings} = bindings;
             false => ("", String::new()),
         };
 
+        let nonce = nonce_attr(&self.cfg.create_nonce);
+
         // the code to fire the `TrunkApplicationStarted` event
         let fire = r#"
 dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 "#;
 
+        let init_with_object = self.wasm_bindgen_features.init_with_object;
+
         match &self.initializer {
             None => format!(
                 r#"
-<script type="module">
+<script type="module"{nonce}>
 import init{import} from '{base}{js}';
-const wasm = await init('{base}{wasm}');
+const wasm = await init({init_arg});
 
 {bind}
 {fire}
-</script>"#
+</script>"#,
+                init_arg = if init_with_object {
+                    format!("{{ module_or_path: '{base}{wasm}' }}")
+                } else {
+                    format!("'{base}{wasm}'")
+                }
             ),
             Some(initializer) => format!(
                 r#"
-<script type="module">
+<script type="module"{nonce}>
 {init}
 
 import init{import} from '{base}{js}';
 import initializer from '{base}{initializer}';
 
-const wasm = await __trunkInitializer(init, '{base}{wasm}', {size}, initializer());
+const wasm = await __trunkInitializer(init, '{base}{wasm}', {size}, initializer(), {init_with_object});
 
 {bind}
 {fire}

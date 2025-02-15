@@ -1,6 +1,6 @@
 mod proxy;
 
-use crate::common::{LOCAL, NETWORK, SERVER};
+use crate::common::{nonce, LOCAL, NETWORK, SERVER};
 use crate::config::rt::RtcServe;
 use crate::tls::TlsConfig;
 use crate::watch::WatchSystem;
@@ -16,8 +16,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, get_service, Router};
 use axum_server::Handle;
 use futures_util::FutureExt;
+use hickory_resolver::TokioAsyncResolver;
+use http::header::CONTENT_SECURITY_POLICY;
+use http::HeaderMap;
 use proxy::{ProxyBuilder, ProxyClientOptions};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,6 +31,7 @@ use tokio::task::JoinHandle;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
+use tracing::log;
 
 const INDEX_HTML: &str = "index.html";
 
@@ -35,7 +39,8 @@ const INDEX_HTML: &str = "index.html";
 pub struct ServeSystem {
     cfg: Arc<RtcServe>,
     watch: WatchSystem,
-    http_addr: String,
+    /// The URL to open when starting
+    open_http_addr: String,
     shutdown_tx: broadcast::Sender<()>,
     //  N.B. we use a broadcast channel here because a watch channel triggers a
     //  false positive on the first read of channel
@@ -54,16 +59,16 @@ impl ServeSystem {
         )
         .await?;
         let prefix = if cfg.tls.is_some() { "https" } else { "http" };
-        let address = match cfg.addresses.first() {
-            Some(address) => *address,
-            None => IpAddr::V4(Ipv4Addr::LOCALHOST),
-        };
+        let address = cfg.addresses.first().map_or_else(
+            || SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), cfg.port),
+            |ipaddr| SocketAddr::new(*ipaddr, cfg.port),
+        );
         let base = cfg.serve_base()?;
-        let http_addr = format!("{prefix}://{address}:{port}{base}", port = cfg.port);
+        let open_http_addr = format!("{prefix}://{address}{base}");
         Ok(Self {
             cfg,
             watch,
-            http_addr,
+            open_http_addr,
             shutdown_tx: shutdown,
             ws_state,
         })
@@ -79,11 +84,12 @@ impl ServeSystem {
             self.cfg.clone(),
             self.shutdown_tx.subscribe(),
             self.ws_state,
-        )?;
+        )
+        .await?;
 
         // Open the browser.
         if self.cfg.open {
-            if let Err(err) = open::that(self.http_addr) {
+            if let Err(err) = open::that(self.open_http_addr) {
                 tracing::error!(error = ?err, "error opening browser");
             }
         }
@@ -114,7 +120,7 @@ impl ServeSystem {
     }
 
     #[tracing::instrument(level = "trace", skip(cfg, shutdown_rx))]
-    fn spawn_server(
+    async fn spawn_server(
         cfg: Arc<RtcServe>,
         shutdown_rx: broadcast::Receiver<()>,
         ws_state: watch::Receiver<ws::State>,
@@ -125,7 +131,7 @@ impl ServeSystem {
         let state = Arc::new(State::new(
             cfg.watch.build.final_dist.clone(),
             serve_base_url.to_string(),
-            &cfg,
+            cfg.clone(),
             ws_state,
         )?);
         let router = router(state, cfg.clone())?;
@@ -136,7 +142,20 @@ impl ServeSystem {
             .map(|addr| (*addr, cfg.port).into())
             .collect::<Vec<_>>();
 
-        show_listening(&cfg, &addr, &serve_base_url);
+        let aliases = cfg
+            .aliases
+            .iter()
+            .map(|alias| format!("{alias}:{}", cfg.port))
+            .collect::<Vec<_>>();
+
+        show_listening(
+            &cfg,
+            &addr,
+            &aliases,
+            &serve_base_url,
+            !cfg.disable_address_lookup,
+        )
+        .await;
 
         let server = run_server(addr, cfg.tls.clone(), router, shutdown_rx);
 
@@ -152,16 +171,26 @@ impl ServeSystem {
     }
 }
 
-/// show where `serve` is listening
-fn show_listening(cfg: &RtcServe, addr: &[SocketAddr], base: &str) {
+/// Show where `serve` is listening
+///
+/// We'll look up addresses, and simply append aliases.
+async fn show_listening(
+    cfg: &RtcServe,
+    addr: &[SocketAddr],
+    aliases: &[String],
+    base: &str,
+    lookup: bool,
+) {
+    // Only show what we didn't show so far
+    let mut cache = HashSet::new();
+
     let prefix = if cfg.tls.is_some() { "https" } else { "http" };
 
-    // prepare local addresses
-    let locals = local_ip_address::list_afinet_netifas()
+    // prepare interface addresses
+    let interfaces = local_ip_address::list_afinet_netifas()
         .map(|addr| {
             addr.into_iter()
                 .map(|(_name, addr)| addr)
-                .filter(|addr| addr.is_loopback())
                 .collect::<Vec<_>>()
         })
         .unwrap_or(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
@@ -171,7 +200,8 @@ fn show_listening(cfg: &RtcServe, addr: &[SocketAddr], base: &str) {
 
     for addr in addr {
         if addr.ip().is_unspecified() {
-            addresses.extend(locals.iter().filter_map(|ipaddr| match ipaddr {
+            // it the "unspecified" address, so we add the corresponding address family addresses
+            addresses.extend(interfaces.iter().filter_map(|ipaddr| match ipaddr {
                 IpAddr::V4(_ip) if addr.is_ipv4() => Some(SocketAddr::new(*ipaddr, addr.port())),
                 IpAddr::V6(_ip) if addr.is_ipv6() => Some(SocketAddr::new(*ipaddr, addr.port())),
                 _ => None,
@@ -181,7 +211,7 @@ fn show_listening(cfg: &RtcServe, addr: &[SocketAddr], base: &str) {
         }
     }
 
-    fn is_loopback(address: SocketAddr) -> bool {
+    fn is_loopback(address: &SocketAddr) -> bool {
         match address {
             SocketAddr::V4(addr) => addr.ip().is_loopback(),
             SocketAddr::V6(addr) => addr.ip().is_loopback(),
@@ -190,11 +220,43 @@ fn show_listening(cfg: &RtcServe, addr: &[SocketAddr], base: &str) {
 
     tracing::info!("{SERVER}server listening at:");
 
-    for address in addresses {
-        tracing::info!(
-            "    {}{prefix}://{address}{base}",
-            if is_loopback(address) { LOCAL } else { NETWORK },
+    for address in &addresses {
+        show_address(
+            &mut cache,
+            is_loopback(address),
+            format!("{prefix}://{address}{base}"),
         );
+    }
+    for alias in aliases {
+        show_address(&mut cache, true, alias);
+    }
+    if lookup {
+        match TokioAsyncResolver::tokio_from_system_conf() {
+            Ok(resolver) => {
+                for address in &addresses {
+                    let local = is_loopback(address);
+                    if let Ok(names) = resolver.reverse_lookup(address.ip()).await {
+                        for name in names {
+                            show_address(
+                                &mut cache,
+                                local,
+                                format!("{prefix}://{name}:{port}{base}", port = address.port()),
+                            );
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                log::warn!("Failed to create system resolver, skipping address resolution: {err}");
+            }
+        }
+    }
+}
+
+fn show_address(cache: &mut HashSet<String>, local: bool, address: impl Into<String>) {
+    let address = address.into();
+    if cache.insert(address.clone()) {
+        tracing::info!("    {}{address}", if local { LOCAL } else { NETWORK });
     }
 }
 
@@ -222,32 +284,36 @@ async fn run_server(
         let router = router.clone();
         let shutdown_handle = shutdown_handle.clone();
         match &tls {
-            Some(tls) => match tls.clone() {
-                #[cfg(feature = "rustls")]
-                TlsConfig::Rustls { config } => {
-                    tasks.push(
-                        async move {
-                            axum_server::bind_rustls(addr, config)
-                                .handle(shutdown_handle)
-                                .serve(router.into_make_service())
-                                .await
-                        }
-                        .boxed(),
-                    );
+            Some(tls) =>
+            {
+                #[allow(unreachable_code)]
+                match tls.clone() {
+                    #[cfg(feature = "rustls")]
+                    TlsConfig::Rustls { config } => {
+                        tasks.push(
+                            async move {
+                                axum_server::bind_rustls(addr, config)
+                                    .handle(shutdown_handle)
+                                    .serve(router.into_make_service())
+                                    .await
+                            }
+                            .boxed(),
+                        );
+                    }
+                    #[cfg(feature = "native-tls")]
+                    TlsConfig::Native { config } => {
+                        tasks.push(
+                            async move {
+                                axum_server::bind_openssl(addr, config)
+                                    .handle(shutdown_handle)
+                                    .serve(router.into_make_service())
+                                    .await
+                            }
+                            .boxed(),
+                        );
+                    }
                 }
-                #[cfg(feature = "native-tls")]
-                TlsConfig::Native { config } => {
-                    tasks.push(
-                        async move {
-                            axum_server::bind_openssl(addr, config)
-                                .handle(shutdown_handle)
-                                .serve(router.into_make_service())
-                                .await
-                        }
-                        .boxed(),
-                    );
-                }
-            },
+            }
 
             None => tasks.push(
                 async move {
@@ -275,10 +341,10 @@ pub struct State {
     pub ws_state: watch::Receiver<ws::State>,
     /// The path to the autoreload websocket
     pub ws_base: String,
-    /// Whether to disable autoreload
-    pub no_autoreload: bool,
     /// Additional headers to add to responses.
     pub headers: HashMap<String, String>,
+    /// Configuration
+    pub cfg: Arc<RtcServe>,
 }
 
 impl State {
@@ -286,7 +352,7 @@ impl State {
     pub fn new(
         dist_dir: PathBuf,
         serve_base: String,
-        cfg: &RtcServe,
+        cfg: Arc<RtcServe>,
         ws_state: watch::Receiver<ws::State>,
     ) -> Result<Self> {
         let mut ws_base = cfg.ws_base()?.to_string();
@@ -299,8 +365,8 @@ impl State {
             serve_base,
             ws_state,
             ws_base,
-            no_autoreload: cfg.no_autoreload,
             headers: cfg.headers.clone(),
+            cfg,
         })
     }
 }
@@ -362,18 +428,30 @@ fn router(state: Arc<State>, cfg: Arc<RtcServe>) -> Result<Router> {
         state.serve_base.as_str()
     );
 
-    let mut builder = ProxyBuilder::new(router);
+    let mut builder = ProxyBuilder::new(cfg.tls.is_some(), router);
 
     // Build proxies
 
     for proxy in &cfg.proxies {
+        let mut request_headers = HeaderMap::new();
+        for (key, value) in &proxy.request_headers {
+            let name = HeaderName::from_bytes(key.as_bytes())
+                .with_context(|| format!("invalid header {:?}", key))?;
+            let value: HeaderValue = value
+                .parse()
+                .with_context(|| format!("invalid header value {:?} for header {}", value, name))?;
+            request_headers.insert(name, value);
+        }
+
         builder = builder.register_proxy(
             proxy.ws,
             &proxy.backend,
+            &request_headers,
             proxy.rewrite.clone(),
             ProxyClientOptions {
                 insecure: proxy.insecure,
                 no_system_proxy: proxy.no_system_proxy,
+                redirect: !proxy.no_redirect,
             },
         )?;
     }
@@ -408,6 +486,12 @@ async fn html_address_middleware(
     // split into parts and body
     let (parts, body) = response.into_parts();
 
+    let nonce = state
+        .cfg
+        .create_nonce
+        .as_ref()
+        .map(|p| (p.as_str(), nonce()));
+
     // turn the body into bytes
     match axum::body::to_bytes(body, 100 * 1024 * 1024).await {
         Err(err) => {
@@ -427,12 +511,32 @@ async fn html_address_middleware(
                         .and_then(|uri| uri.to_str().map(|s| format!("'{}'", s)).ok())
                         .unwrap_or_else(|| "window.location.host".into());
 
-                    let data_str = data_str
+                    let mut data_str = data_str
                         // minification will turn quotes into backticks, so we have to replace both
                         .replace("'{{__TRUNK_ADDRESS__}}'", &host)
                         .replace("`{{__TRUNK_ADDRESS__}}`", &host)
                         // here we only replace the string value
                         .replace("{{__TRUNK_WS_BASE__}}", &state.ws_base);
+
+                    let mut csp = None;
+
+                    if let Some((var, val)) = nonce {
+                        data_str = data_str.replace(var, &val);
+                        csp = state
+                            .cfg
+                            .csp
+                            .as_ref()
+                            .map(|csp| csp.join(";").replace("{{NONCE}}", &val).parse());
+                    }
+
+                    match csp {
+                        Some(Ok(csp)) => {
+                            parts.headers.insert(CONTENT_SECURITY_POLICY, csp);
+                        }
+                        Some(Err(e)) => tracing::error!("failed to encode csp header: {e:?}"),
+                        None => {}
+                    };
+
                     let bytes_vec = data_str.as_bytes().to_vec();
                     parts.headers.insert(CONTENT_LENGTH, bytes_vec.len().into());
                     bytes = Bytes::from(bytes_vec);

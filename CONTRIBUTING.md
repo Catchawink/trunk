@@ -27,3 +27,19 @@ We follow [semver](https://semver.org/spec/v2.0.0.html) for versioning this syst
     - all release tags should start with the letter `v` followed by a semver version.
 - [ ] CI is configured for release tags and will create a new GitHub release, and will upload release artifacts to the release page. Verify that this process has completed successfully.
 
+## SSL
+
+Trunk can use either `native-tls` or `rustls` for SSL support. `rustls` without `aws-lc-sys` is the default backend, which should build out-of-the-box on all platforms.
+
+To opt into a different one, you can use the following command:
+```sh
+cargo build --no-default-features -F update_check,native-tls
+```
+If you want to use `native-tls` you can install OpenSSL using the instructions from one of the following resources:
++ https://stackoverflow.com/a/62729715/2961550
++ https://github.com/sfackler/rust-openssl/issues/1062#issuecomment-489441940
+Or try using [rust-openssl from PR #2139](https://github.com/sfackler/rust-openssl/pull/2139) by updating the `Cargo.toml` file with
+```diff
+- openssl = { version = "0.10", default-features = false, optional = true }
++ openssl = { git = "https://github.com/micolous/rust-openssl", branch = "windows-build", default-features = false, optional = true }
+```

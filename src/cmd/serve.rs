@@ -25,11 +25,19 @@ pub struct Serve {
     #[arg(short = 'A', long, env = "TRUNK_SERVE_PREFER_ADDRESS_FAMILY")]
     pub prefer_address_family: Option<AddressFamily>,
     /// The port to serve on [default: 8080]
-    #[arg(long, env = "TRUNK_SERVE_PORT")]
+    #[arg(short, long, env = "TRUNK_SERVE_PORT")]
     pub port: Option<u16>,
+    /// The aliases to serve on
+    #[arg(long, env = "TRUNK_SERVE_ALIAS")]
+    pub alias: Option<Vec<String>>,
+    /// Disable the lookup of addresses serving on during startup
+    #[arg(long, env = "TRUNK_SERVE_DISABLE_ADDRESS_LOOKUP")]
+    #[arg(default_missing_value="true", num_args=0..=1)]
+    pub disable_address_lookup: Option<bool>,
     /// Open a browser tab once the initial build is complete [default: false]
     #[arg(long, env = "TRUNK_SERVE_OPEN")]
-    pub open: bool,
+    #[arg(default_missing_value="true", num_args=0..=1)]
+    pub open: Option<bool>,
     /// Disable auto-reload of the web app
     #[arg(long, env = "TRUNK_SERVE_NO_AUTORELOAD")]
     #[arg(default_missing_value="true", num_args=0..=1)]
@@ -57,6 +65,10 @@ pub struct Serve {
     /// A base path to serve the application from [default: <public-url>]
     #[arg(long, env = "TRUNK_SERVE_SERVE_BASE")]
     pub serve_base: Option<String>,
+    /// Disable Content-Security-Policy [default: false]
+    #[arg(long)]
+    #[arg(default_missing_value="false", num_args=0..=1)]
+    pub disable_csp: Option<bool>,
 
     // NOTE: flattened structures come last
     #[command(flatten)]
@@ -89,6 +101,13 @@ pub struct ProxyArgs {
         requires = "proxy_backend"
     )]
     pub proxy_no_system_proxy: bool,
+    /// Configure the proxy to not automatically follow redirects if a backend responds with a redirect
+    #[arg(
+        long,
+        env = "TRUNK_SERVE_PROXY_NO_REDIRECT",
+        requires = "proxy_backend"
+    )]
+    pub proxy_no_redirect: bool,
 }
 
 impl Serve {
@@ -98,7 +117,9 @@ impl Serve {
             address,
             prefer_address_family,
             port,
-            open: _,
+            alias,
+            disable_address_lookup,
+            open,
             proxy:
                 ProxyArgs {
                     proxy_backend,
@@ -106,6 +127,7 @@ impl Serve {
                     proxy_ws,
                     proxy_insecure,
                     proxy_no_system_proxy,
+                    proxy_no_redirect,
                 },
             no_autoreload,
             no_error_reporting,
@@ -116,12 +138,17 @@ impl Serve {
             tls_cert_path,
             serve_base,
             watch,
+            disable_csp,
         } = self;
 
         // apply overrides
 
         config.serve.addresses = address.unwrap_or(config.serve.addresses);
         config.serve.port = port.unwrap_or(config.serve.port);
+        config.serve.aliases = alias.unwrap_or(config.serve.aliases);
+        config.serve.disable_address_lookup =
+            disable_address_lookup.unwrap_or(config.serve.disable_address_lookup);
+        config.serve.open = open.unwrap_or(config.serve.open);
         config.serve.prefer_address_family =
             prefer_address_family.or(config.serve.prefer_address_family);
         config.serve.serve_base = serve_base.or(config.serve.serve_base);
@@ -136,15 +163,18 @@ impl Serve {
 
         config.serve.ws_protocol = ws_protocol.or(config.serve.ws_protocol);
         config.serve.ws_base = ws_base.or(config.serve.ws_base);
+        config.serve.disable_csp = disable_csp.unwrap_or(config.serve.disable_csp);
 
         if let Some(backend) = proxy_backend {
             // we have a single proxy from the command line
             config.proxies.0.push(Proxy {
                 backend: backend.into(),
+                request_headers: Default::default(),
                 rewrite: proxy_rewrite,
                 ws: proxy_ws,
                 insecure: proxy_insecure,
                 no_system_proxy: proxy_no_system_proxy,
+                no_redirect: proxy_no_redirect,
             });
         }
 
@@ -170,9 +200,11 @@ impl Serve {
                 },
                 poll: self.watch.poll.then_some(self.watch.poll_interval.0),
                 enable_cooldown: self.watch.enable_cooldown,
+                clear_screen: self.watch.clear_screen,
                 no_error_reporting: cfg.serve.no_error_reporting,
             },
-            open: self.open,
+            // This will be the effective value for `serve.open` during runtime.
+            open: self.open.unwrap_or(cfg.serve.open),
         })
         .await?;
 

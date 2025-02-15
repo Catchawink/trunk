@@ -2,9 +2,10 @@
 pub mod html_rewrite;
 
 use anyhow::{anyhow, bail, Context, Result};
-use async_recursion::async_recursion;
+use base64::{engine::general_purpose, Engine};
 use console::Emoji;
 use once_cell::sync::Lazy;
+use rand::RngCore;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt::Debug;
@@ -31,7 +32,6 @@ static CWD: Lazy<PathBuf> =
     Lazy::new(|| std::env::current_dir().expect("error getting current dir"));
 
 /// A utility function to recursively copy a directory.
-#[async_recursion]
 pub async fn copy_dir_recursive<F, T>(from_dir: F, to_dir: T) -> Result<HashSet<PathBuf>>
 where
     F: AsRef<Path> + Debug + Send + 'static,
@@ -69,7 +69,10 @@ where
         .context(anyhow!("Unable to read next dir entry"))?
     {
         if entry.file_type().await?.is_dir() {
-            let files = copy_dir_recursive(entry.path(), to.join(entry.file_name())).await?;
+            let files = Box::pin(async move {
+                copy_dir_recursive(entry.path(), to.join(entry.file_name())).await
+            })
+            .await?;
             collector.extend(files);
         } else {
             let to = to.join(entry.file_name());
@@ -158,14 +161,19 @@ pub fn strip_prefix(target: &Path) -> &Path {
 
 /// Run a global command with the given arguments and make sure it completes successfully. If it
 /// fails an error is returned.
-#[tracing::instrument(level = "trace", skip(name, path, args))]
+#[tracing::instrument(level = "trace", skip(name, args))]
 pub async fn run_command(
     name: &str,
-    path: &Path,
+    path: impl AsRef<Path> + Debug,
     args: &[impl AsRef<OsStr> + Debug],
+    working_dir: impl AsRef<Path> + Debug,
 ) -> Result<()> {
     tracing::debug!(?args, "{name} args");
+
+    let path = path.as_ref();
+
     let status = Command::new(path)
+        .current_dir(working_dir.as_ref())
         .args(args)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -179,12 +187,14 @@ pub async fn run_command(
         .wait()
         .await
         .with_context(|| format!("error during {name} call"))?;
+
     if !status.success() {
         bail!(
             "{name} call to executable '{}' with args: '{args:?}' returned a bad status: {status}",
             path.display()
         );
     }
+
     Ok(())
 }
 
@@ -261,4 +271,24 @@ pub fn path_to_href(path: impl AsRef<Path>) -> String {
         .map(|c| c.to_string_lossy())
         .collect::<Vec<_>>();
     path.join("/")
+}
+
+/// A nonce random generator for script and style
+///
+/// https://developer.mozilla.org/en-US/docs/Web/HTML/Global_attributes/nonce
+pub fn nonce() -> String {
+    let mut buffer = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut buffer);
+    general_purpose::STANDARD.encode(buffer)
+}
+
+/// Creates the 'nonce' attribute.
+///
+/// Result is intented to be placed immediately without any spacing after the
+/// html tag or other attributes.
+pub fn nonce_attr(attr: &Option<String>) -> String {
+    match attr {
+        Some(v) => format!(r#" nonce="{v}""#),
+        None => "".to_string(),
+    }
 }

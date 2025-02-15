@@ -4,6 +4,8 @@ use anyhow::Context;
 use axum::http::Uri;
 use axum::Router;
 use console::Emoji;
+use http::HeaderMap;
+use reqwest::redirect::Policy;
 use reqwest::Client;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -12,14 +14,16 @@ const DANGER: Emoji = Emoji("⚠️", "(!)");
 
 /// A builder for the proxy router
 pub(crate) struct ProxyBuilder {
+    tls: bool,
     router: Router,
     clients: ProxyClients,
 }
 
 impl ProxyBuilder {
     /// Create a new builder
-    pub fn new(router: Router) -> Self {
+    pub fn new(tls: bool, router: Router) -> Self {
         Self {
+            tls,
             router,
             clients: Default::default(),
         }
@@ -30,11 +34,23 @@ impl ProxyBuilder {
         mut self,
         ws: bool,
         backend: &Uri,
+        request_headers: &HeaderMap,
         rewrite: Option<String>,
         opts: ProxyClientOptions,
     ) -> anyhow::Result<Self> {
+        let proto = match self.tls {
+            true => "https",
+            false => "http",
+        }
+        .to_string();
+
         if ws {
-            let handler = ProxyHandlerWebSocket::new(backend.clone(), rewrite);
+            let handler = ProxyHandlerWebSocket::new(
+                proto,
+                backend.clone(),
+                request_headers.clone(),
+                rewrite,
+            );
             tracing::info!(
                 "{}proxying websocket {} -> {}",
                 SERVER,
@@ -47,12 +63,23 @@ impl ProxyBuilder {
             let no_sys_proxy = opts.no_system_proxy;
             let insecure = opts.insecure;
             let client = self.clients.get_client(opts)?;
-            let handler = ProxyHandlerHttp::new(client, backend.clone(), rewrite);
+            let handler = ProxyHandlerHttp::new(
+                proto,
+                client,
+                backend.clone(),
+                request_headers.clone(),
+                rewrite,
+            );
             tracing::info!(
-                "{}proxying {} -> {}{}{}",
+                "{}proxying {} -> {} {} {}{}",
                 SERVER,
                 handler.path(),
                 &backend,
+                &request_headers
+                    .iter()
+                    .map(|(header_name, header_value)| format!("{header_name}={header_value:?}"))
+                    .collect::<Vec<String>>()
+                    .join(";"),
                 if no_sys_proxy {
                     "; ignoring system proxy"
                 } else {
@@ -78,6 +105,7 @@ impl ProxyBuilder {
 pub(crate) struct ProxyClientOptions {
     pub insecure: bool,
     pub no_system_proxy: bool,
+    pub redirect: bool,
 }
 
 #[derive(Default)]
@@ -99,7 +127,13 @@ impl ProxyClients {
 
     /// Create a new client for proxying
     fn create_client(opts: ProxyClientOptions) -> anyhow::Result<Client> {
-        let mut builder = reqwest::ClientBuilder::new().http1_only();
+        let mut builder = reqwest::ClientBuilder::new()
+            .http1_only()
+            .redirect(if opts.redirect {
+                Policy::default()
+            } else {
+                Policy::none()
+            });
 
         #[cfg(any(feature = "native-tls", feature = "rustls"))]
         if opts.insecure {

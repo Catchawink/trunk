@@ -19,18 +19,24 @@ pub struct Build {
     /// The index HTML file to drive the bundling process
     pub target: Option<PathBuf>,
 
+    /// The name of the output HTML file.
+    #[arg(long, env = "TRUNK_BUILD_HTML_OUTPUT")]
+    pub html_output: Option<String>,
+
     /// Build in release mode
     #[arg(long, env = "TRUNK_BUILD_RELEASE")]
     #[arg(default_missing_value="true", num_args=0..=1)]
     pub release: Option<bool>,
 
+    /// Cargo profile to use for building.
+    #[arg(long, env = "TRUNK_BUILD_CARGO_PROFILE")]
+    pub cargo_profile: Option<String>,
+
     /// The output dir for all final assets
     #[arg(short, long, env = "TRUNK_BUILD_DIST")]
     pub dist: Option<PathBuf>,
 
-    /// Run without accessing the network
-    #[arg(long, env = "TRUNK_BUILD_OFFLINE")]
-    #[arg(default_missing_value="true", num_args=0..=1)]
+    #[arg(from_global)]
     pub offline: Option<bool>,
 
     /// Require Cargo.lock and cache are up to date
@@ -75,6 +81,10 @@ pub struct Build {
     #[arg(long, env = "TRUNK_BUILD_FILEHASH")]
     #[arg(default_missing_value="true", num_args=0..=1)]
     pub filehash: Option<bool>,
+
+    /// Which example to build
+    #[arg(long, env = "TRUNK_BUILD_EXAMPLE")]
+    pub example: Option<String>,
 
     /// When desired, set a custom root certificate chain (same format as Cargo's config.toml http.cainfo)
     #[arg(long, env = "TRUNK_BUILD_ROOT_CERTIFICATE")]
@@ -121,7 +131,9 @@ impl Build {
         let Self {
             core,
             target,
+            html_output,
             release,
+            cargo_profile,
             dist,
             offline,
             frozen,
@@ -132,6 +144,7 @@ impl Build {
             all_features,
             features,
             filehash,
+            example,
             root_certificate,
             accept_invalid_certs,
             minify,
@@ -141,7 +154,9 @@ impl Build {
         } = self;
 
         config.build.target = target.unwrap_or(config.build.target);
+        config.build.html_output = html_output.or(config.build.html_output);
         config.build.release = release.unwrap_or(config.build.release);
+        config.build.cargo_profile = cargo_profile.or(config.build.cargo_profile);
         config.build.dist = dist.unwrap_or(config.build.dist);
         config.build.offline = offline.unwrap_or(config.build.offline);
         config.build.frozen = frozen.unwrap_or(config.build.frozen);
@@ -156,6 +171,7 @@ impl Build {
         config.build.features = features.unwrap_or(config.build.features);
 
         config.build.filehash = filehash.unwrap_or(config.build.filehash);
+        config.build.example = example.or(config.build.example);
 
         config.build.root_certificate = root_certificate.or(config.build.root_certificate);
         config.build.accept_invalid_certs =
